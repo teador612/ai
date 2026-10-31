@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import warnings
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,10 @@ FEATURES = [f"odds_{i}" for i in range(36, 75)]
 TARGETS = {"2,5 Üst": "target_o25", "İY 1,5 Üst": "target_ht15", "KG Var": "target_btts"}
 MS_LABELS = {1: "MS 1", 0: "MS X", 2: "MS 2"}
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def log(message):
+    print(message, flush=True)
 
 
 def fit_ensemble(train, target, multiclass=False):
@@ -84,6 +89,29 @@ def outcome_result(row, label):
     return bool(row[target] == 1)
 
 
+def fixture_key(row):
+    """Stable ID for matching a fixture to its previously stored prediction."""
+    day = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+    parts = [day, row.get("time", ""), row.get("league", ""), row.get("home", ""), row.get("away", "")]
+    return "|".join(" ".join(str(value or "").strip().casefold().split()) for value in parts)
+
+
+def update_result(prediction, row):
+    """Refresh result fields while preserving the original historical pick."""
+    prediction["time"] = str(row.time)
+    prediction["league"] = str(row.league)
+    prediction["home"] = str(row.home)
+    prediction["away"] = str(row.away)
+    prediction["score"] = ""
+    prediction["ht_score"] = ""
+    if pd.notna(row.ft_home) and pd.notna(row.ft_away):
+        prediction["score"] = f"{int(row.ft_home)} - {int(row.ft_away)}"
+    if pd.notna(row.ht_home) and pd.notna(row.ht_away):
+        prediction["ht_score"] = f"{int(row.ht_home)} - {int(row.ht_away)}"
+    prediction["primary_correct"] = outcome_result(row, prediction["primary"]["label"])
+    return prediction
+
+
 def main():
     if not INPUT.exists():
         raise FileNotFoundError(f"Run convert_excel_to_json.py first; missing {INPUT}")
@@ -93,22 +121,54 @@ def main():
     for column in FEATURES:
         data[column] = pd.to_numeric(data[column], errors="coerce")
 
+    cached = {}
+    if OUTPUT.exists():
+        try:
+            old_payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
+            for item in old_payload.get("predictions", []):
+                key = item.get("fixture_id") or fixture_key(item)
+                cached[key] = item
+            log(f"Önceki tahmin önbelleği: {len(cached):,} maç")
+        except (json.JSONDecodeError, OSError) as exc:
+            log(f"Önceki tahmin dosyası okunamadı, yeniden üretilecek: {exc}")
+
+    today = pd.Timestamp.now(tz=ZoneInfo("Europe/Istanbul")).date()
     predictions = []
-    for day in sorted(data.date.unique()):
+    to_generate = {}
+    reused = 0
+
+    # Keep historical picks fixed; only refresh their outcome/score fields.
+    # Recalculate today's and future fixtures, plus any genuinely new fixture.
+    for _, row in data.iterrows():
+        if row[FEATURES].notna().sum() < 3:
+            continue
+        day = pd.Timestamp(row.date)
+        key = fixture_key(row)
+        previous = cached.get(key)
+        if previous is not None and day.date() < today:
+            prediction = update_result(dict(previous), row)
+            prediction["fixture_id"] = key
+            predictions.append(prediction)
+            reused += 1
+        else:
+            to_generate.setdefault(day, []).append((key, row.to_dict()))
+
+    log(f"Korunan geçmiş tahmin: {reused:,}")
+    log(f"Yeniden tahmin edilecek maç günü: {len(to_generate):,}")
+
+    for day in sorted(to_generate):
+        records = to_generate[day]
         train = data[(data.date < day) & data.target_o25.notna()]
-        fixtures = data[data.date == day]
         if len(train) < 30:
+            log(f"{day.date()}: Yetersiz geçmiş eğitim maçı ({len(train)}), atlandı")
             continue
         fitted = {label: fit_ensemble(train, target) for label, target in TARGETS.items()}
         fitted["MS"] = fit_ensemble(train, "target_ms", multiclass=True)
 
-        fixture_rows = fixtures.reset_index(drop=True)
+        fixture_rows = pd.DataFrame([row for _, row in records]).reset_index(drop=True)
         probability_tables = {name: average_probabilities(models, fixture_rows[FEATURES])
                               for name, models in fitted.items()}
         for position, row in fixture_rows.iterrows():
-            x = fixture_rows.loc[[position], FEATURES]
-            if x.notna().sum(axis=1).iloc[0] < 3:
-                continue
             market_probs = {name: {cls: float(values[position]) for cls, values in probs.items()}
                             for name, probs in probability_tables.items()}
             options = []
@@ -123,28 +183,20 @@ def main():
             if not options:
                 continue
             options.sort(key=lambda item: item["probability"], reverse=True)
-            primary = options[0]
-            result = outcome_result(row, primary["label"])
-            score = ""
-            if pd.notna(row.ft_home) and pd.notna(row.ft_away):
-                score = f"{int(row.ft_home)} - {int(row.ft_away)}"
-            ht_score = ""
-            if pd.notna(row.ht_home) and pd.notna(row.ht_away):
-                ht_score = f"{int(row.ht_home)} - {int(row.ht_away)}"
-            predictions.append({
+            prediction = {
                 "date": pd.Timestamp(day).strftime("%Y-%m-%d"),
-                "time": str(row.time), "league": str(row.league),
-                "home": str(row.home), "away": str(row.away),
-                "primary": primary,
-                "others": options[1:],
-                "primary_correct": result,
-                "score": score,
-                "ht_score": ht_score,
-            })
-        print(f"{pd.Timestamp(day).date()}: {len(fixtures)} fixtures, {len(train)} earlier completed matches")
+                "time": str(row.get("time", "")), "league": str(row.get("league", "")),
+                "home": str(row.get("home", "")), "away": str(row.get("away", "")),
+                "primary": options[0], "others": options[1:],
+                "primary_correct": None, "score": "", "ht_score": "",
+                "fixture_id": records[position][0],
+            }
+            predictions.append(update_result(prediction, row))
+        log(f"{pd.Timestamp(day).date()}: {len(records)} yeni/güncel maç, {len(train)} önceki maç")
 
+    predictions.sort(key=lambda item: (item["date"], item["time"], item["home"], item["away"]))
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"predictions": predictions}
+    payload = {"predictions": predictions, "generated_at": pd.Timestamp.now().isoformat()}
     OUTPUT.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(f"Wrote {len(predictions):,} predictions to {OUTPUT} ({OUTPUT.stat().st_size:,} bytes).")
 

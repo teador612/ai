@@ -2,4 +2,3 @@
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
-docs/predictions.json
