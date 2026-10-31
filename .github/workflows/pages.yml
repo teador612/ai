@@ -1,5 +1,4 @@
 name: Build predictions and deploy GitHub Pages
-
 on:
   push:
     branches: [main, master]
@@ -11,14 +10,11 @@ on:
       - "requirements.txt"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: github-pages
   cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -67,7 +63,9 @@ jobs:
           git add input/matches.json docs/predictions.json
           if ! git diff --cached --quiet; then
             git commit -m "Refresh match predictions from Excel"
-            git push
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:main
           fi
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -75,7 +73,6 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
-
   deploy:
     environment:
       name: github-pages
