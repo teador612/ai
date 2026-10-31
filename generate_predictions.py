@@ -128,6 +128,9 @@ def main():
             score = ""
             if pd.notna(row.ft_home) and pd.notna(row.ft_away):
                 score = f"{int(row.ft_home)} - {int(row.ft_away)}"
+            ht_score = ""
+            if pd.notna(row.ht_home) and pd.notna(row.ht_away):
+                ht_score = f"{int(row.ht_home)} - {int(row.ht_away)}"
             predictions.append({
                 "date": pd.Timestamp(day).strftime("%Y-%m-%d"),
                 "time": str(row.time), "league": str(row.league),
@@ -136,6 +139,7 @@ def main():
                 "others": options[1:],
                 "primary_correct": result,
                 "score": score,
+                "ht_score": ht_score,
             })
         print(f"{pd.Timestamp(day).date()}: {len(fixtures)} fixtures, {len(train)} earlier completed matches")
 
