@@ -1,18 +1,17 @@
 
 from pathlib import Path
 import re
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parent
-
 XLSX = ROOT / "input" / "Excel-Açılış-Cep-Telefonu.xlsx"
 JSON = ROOT / "input" / "matches.json"
 
 # Excel sütunları A'dan başlıyor.
-# Python indeksleri sıfırdan başladığı için Excel sütun numarasından 1 çıkarılır.
 COLS = {
     "score_ht": 21,  # V - SKOR İY
     "score_ms": 22,  # W - SKOR MS
@@ -23,31 +22,73 @@ COLS = {
     "away": 28,      # AC - DEPLASMAN
 }
 
-# AD sütunundan başlayarak 39 oran sütunu.
-ODDS_START = 29
+# Mevcut model özellikleri aynen korunuyor.
 FEATURES = [f"odds_{i}" for i in range(36, 75)]
 
 
-def parse_odds(value):
+def parse_date(value):
+    """Excel tarihlerini ve farklı metin tarih biçimlerini okur."""
+
     if pd.isna(value):
-        return np.nan
+        return pd.NaT
+
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value).normalize()
 
     if isinstance(value, (int, float, np.number)):
-        return float(value)
+        number = float(value)
 
-    text = str(value).strip().replace(" ", "").replace(",", ".")
+        # Excel seri tarih numarası.
+        if 20000 <= number <= 80000:
+            return (
+                pd.Timestamp("1899-12-30") +
+                pd.to_timedelta(number, unit="D")
+            ).normalize()
+
+        return pd.NaT
+
+    text = str(value).strip()
+
+    if not text:
+        return pd.NaT
+
+    formats = [
+        "%d.%m.%Y",
+        "%d.%m.%y",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d.%m.%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+
+    for fmt in formats:
+        try:
+            return pd.Timestamp(
+                datetime.strptime(text, fmt)
+            ).normalize()
+        except ValueError:
+            continue
 
     try:
-        return float(text)
-    except (ValueError, TypeError):
-        return np.nan
+        result = pd.to_datetime(
+            text,
+            dayfirst=True,
+            errors="coerce"
+        )
+
+        if pd.isna(result):
+            return pd.NaT
+
+        return pd.Timestamp(result).normalize()
+
+    except (ValueError, TypeError, OverflowError):
+        return pd.NaT
 
 
 def parse_score(value):
-    """
-    SKOR İY ve SKOR MS hücrelerini ayrıştırır.
-    Desteklenen örnekler: 1-0, 1:0, 1 - 0, 1–0.
-    """
+    """1-0, 1:0, 1 - 0 biçimindeki skorları ayırır."""
 
     if pd.isna(value):
         return np.nan, np.nan
@@ -68,6 +109,22 @@ def parse_score(value):
     return int(match.group(1)), int(match.group(2))
 
 
+def parse_odds(value):
+    if pd.isna(value):
+        return np.nan
+
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+
+    text = str(value).strip()
+    text = text.replace(" ", "").replace(",", ".")
+
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        return np.nan
+
+
 def main():
     if not XLSX.exists():
         raise FileNotFoundError(
@@ -83,16 +140,13 @@ def main():
         engine="openpyxl"
     )
 
-    required_columns = ODDS_START + len(FEATURES)
-
-    if raw.shape[1] < required_columns:
+    if raw.shape[1] < 75:
         raise ValueError(
             f"Excel sütun sayısı yetersiz. "
-            f"Beklenen: en az {required_columns}, "
-            f"bulunan: {raw.shape[1]}"
+            f"Beklenen: en az 75, bulunan: {raw.shape[1]}"
         )
 
-    # Veriler 9. satırdan itibaren başlıyor.
+    # Mevcut dosya yapısındaki gibi 9. satırdan itibaren veriler.
     source = raw.iloc[8:].reset_index(drop=True)
 
     data = pd.DataFrame()
@@ -101,54 +155,55 @@ def main():
     for name, index in COLS.items():
         data[name] = source.iloc[:, index]
 
-    # İlk yarı skorlarını ayrıştır.
+    # İlk yarı skorları.
     ht_scores = data["score_ht"].map(parse_score)
 
-    data["ht_home"] = ht_scores.map(lambda score: score[0])
-    data["ht_away"] = ht_scores.map(lambda score: score[1])
+    data["ht_home"] = ht_scores.map(lambda x: x[0])
+    data["ht_away"] = ht_scores.map(lambda x: x[1])
 
-    # Maç sonu skorlarını ayrıştır.
+    # Maç sonu skorları.
     ft_scores = data["score_ms"].map(parse_score)
 
-    data["ft_home"] = ft_scores.map(lambda score: score[0])
-    data["ft_away"] = ft_scores.map(lambda score: score[1])
+    data["ft_home"] = ft_scores.map(lambda x: x[0])
+    data["ft_away"] = ft_scores.map(lambda x: x[1])
 
     data.drop(
         columns=["score_ht", "score_ms"],
         inplace=True
     )
 
-    # Oranları AD sütunundan başlayarak oku.
-    for offset, feature_index in enumerate(range(36, 75)):
-        excel_index = ODDS_START + offset
-        column = f"odds_{feature_index}"
-
-        data[column] = (
-            source.iloc[:, excel_index]
-            .map(parse_odds)
+    # Modelin mevcut odds_36 - odds_74 sütunları.
+    for index in range(36, 75):
+        data[f"odds_{index}"] = (
+            source.iloc[:, index].map(parse_odds)
         )
 
-    # Tarih dönüşümü.
-    data["date"] = pd.to_datetime(
-        data["date"],
-        errors="coerce"
-    ).dt.normalize()
+    # Tarihleri güvenli biçimde dönüştür.
+    data["date"] = data["date"].map(parse_date)
 
-    # Skor alanlarını sayısal yap.
-    score_columns = [
+    valid_dates = data["date"].notna().sum()
+
+    if valid_dates == 0:
+        samples = raw.iloc[8:, 23].head(15).tolist()
+
+        raise ValueError(
+            "Tarih sütunundan geçerli tarih okunamadı. "
+            f"X sütunundaki örnek değerler: {samples}"
+        )
+
+    # Skorları sayısal hale getir.
+    for column in [
         "ht_home",
         "ht_away",
         "ft_home",
         "ft_away"
-    ]
-
-    for column in score_columns:
+    ]:
         data[column] = pd.to_numeric(
             data[column],
             errors="coerce"
         )
 
-    # Takım, lig ve saat bilgileri.
+    # Metin alanları.
     for column in ["home", "away", "league", "time"]:
         data[column] = (
             data[column]
@@ -160,16 +215,10 @@ def main():
     # Tarihi olmayan satırları kaldır.
     data = data.dropna(subset=["date"]).copy()
 
-    # Boş dosya oluşturulmasını engelle.
     if data.empty:
-        raise ValueError(
-            "Hiç maç aktarılamadı. "
-            "Tarih sütunu X olarak ayarlandı ancak geçerli tarih bulunamadı. "
-            "Excel'deki veri başlangıç satırını ve X sütununu kontrol et."
-        )
+        raise ValueError("Geçerli maç kaydı bulunamadı.")
 
-    # Maç sonucu hedefi:
-    # 1 = Ev sahibi, 0 = Beraberlik, 2 = Deplasman.
+    # MS sonucu: 1 ev sahibi, 0 beraberlik, 2 deplasman.
     data["target_ms"] = np.select(
         [
             data["ft_home"] > data["ft_away"],
@@ -180,7 +229,7 @@ def main():
         default=np.nan
     )
 
-    # 2,5 gol üstü.
+    # 2,5 Üst.
     data["target_o25"] = np.where(
         data["ft_home"].notna() & data["ft_away"].notna(),
         (
@@ -189,7 +238,7 @@ def main():
         np.nan
     )
 
-    # İlk yarı 1,5 gol üstü.
+    # İY 1,5 Üst.
     data["target_ht15"] = np.where(
         data["ht_home"].notna() & data["ht_away"].notna(),
         (
@@ -198,7 +247,7 @@ def main():
         np.nan
     )
 
-    # Karşılıklı gol.
+    # KG Var.
     data["target_btts"] = np.where(
         data["ft_home"].notna() & data["ft_away"].notna(),
         (
@@ -208,7 +257,7 @@ def main():
         np.nan
     )
 
-    # JSON kaydet.
+    # JSON oluştur.
     JSON.parent.mkdir(parents=True, exist_ok=True)
 
     data.to_json(
@@ -233,15 +282,15 @@ def main():
         data[FEATURES].notna().sum(axis=1) > 0
     ).sum()
 
-    print("")
-    print("========== AKTARIM RAPORU ==========")
+    print("\n========== AKTARIM RAPORU ==========")
     print(f"Toplam maç              : {len(data):,}")
+    print(f"Geçerli tarih           : {valid_dates:,}")
     print(f"İlk yarı skoru bulunan  : {ht_count:,}")
     print(f"Maç sonu skoru bulunan  : {ft_count:,}")
     print(f"Oranı bulunan maç       : {odds_count:,}")
-    print(f"JSON dosyası            : {JSON}")
-    print(f"Dosya boyutu            : {JSON.stat().st_size:,} byte")
+    print(f"JSON boyutu             : {JSON.stat().st_size:,} byte")
     print("====================================")
+    print("Aktarım başarılı.")
 
 
 if __name__ == "__main__":
