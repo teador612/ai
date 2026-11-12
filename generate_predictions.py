@@ -1,11 +1,6 @@
-"""Chronological, leakage-safe ensemble predictions for the GitHub Pages site.
 
-Every fixture is predicted using only matches dated strictly before its date.
-The four existing ML models are retained. An exact-opening-odds historical
-source is added, and source weights are learned from earlier out-of-sample
-predictions using Brier scores, separately by market and (when sufficiently
-large) league.
-"""
+"""Incremental, chronological and leakage-safe ensemble predictions."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,6 +8,7 @@ from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import hashlib
 import json
 import math
 import os
@@ -28,11 +24,19 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
 
+
 ROOT = Path(__file__).resolve().parent
+
 INPUT = ROOT / "input" / "matches.json"
 OUTPUT = ROOT / "docs" / "predictions.json"
 BACKUP = ROOT / "docs" / "predictions.backup.json"
 TEMP_OUTPUT = ROOT / "docs" / "predictions.tmp.json"
+
+STATE_DIR = ROOT / "cache"
+STATE_FILE = STATE_DIR / "predictions_state.json"
+TEMP_STATE = STATE_DIR / "predictions_state.tmp.json"
+
+STATE_VERSION = 1
 
 FEATURES = [f"odds_{i}" for i in range(36, 75)]
 MODEL_NAMES = ("rf", "xgb", "lgbm", "catboost")
@@ -67,7 +71,7 @@ MIN_TRAIN_ROWS = 30
 MIN_EXACT_ODDS_SAMPLE = 5
 MIN_WEIGHT_SAMPLE = 30
 LEAGUE_WEIGHT_SAMPLE = 30
-Brier_TEMPERATURE = 0.12
+BRIER_TEMPERATURE = 0.12
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -99,8 +103,68 @@ def fixture_key(row) -> str:
     )
 
 
+def canonical_value(value):
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.Timestamp(value).isoformat()
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, (str, int, bool)):
+        return value
+
+    return str(value)
+
+
+def input_fingerprint(data: pd.DataFrame) -> str:
+    """Hash all relevant rows up to the last completed date."""
+    columns = [
+        "date", "time", "league", "home", "away",
+        *FEATURES,
+        *[config["target"] for config in MARKETS.values()],
+        "ft_home", "ft_away", "ht_home", "ht_away",
+    ]
+
+    columns = [column for column in columns if column in data.columns]
+    digest = hashlib.sha256()
+
+    for row in data[columns].itertuples(index=False, name=None):
+        values = [canonical_value(value) for value in row]
+        encoded = json.dumps(
+            values,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        digest.update(encoded)
+        digest.update(b"\n")
+
+    return digest.hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
 def fit_models(train: pd.DataFrame, target: str, multiclass: bool = False):
-    """Fit the four existing estimators and return individually addressable models."""
     sample = train.dropna(subset=[target])
 
     if len(sample) < MIN_TRAIN_ROWS or sample[target].nunique() < 2:
@@ -184,11 +248,7 @@ def fit_models(train: pd.DataFrame, target: str, multiclass: bool = False):
     return fitted
 
 
-def predict_model_probabilities(
-    fitted: dict,
-    X: pd.DataFrame,
-    multiclass: bool,
-):
+def predict_model_probabilities(fitted, X, multiclass: bool):
     result = {}
 
     for name, item in fitted.items():
@@ -228,7 +288,6 @@ def get_actual(row, market: str):
 
 
 def build_odds_index(data: pd.DataFrame):
-    """key -> sorted dates and outcomes, so each query can use only prior dates."""
     index = {}
 
     for market, config in MARKETS.items():
@@ -253,8 +312,7 @@ def build_odds_index(data: pd.DataFrame):
                 if odd is None or odd <= 1.0:
                     continue
 
-                actual = int(target_value)
-                hit = int(actual == int(outcome))
+                hit = int(int(target_value) == int(outcome))
 
                 buckets[round(odd, 2)].append(
                     (pd.Timestamp(date_value).value, hit)
@@ -265,7 +323,6 @@ def build_odds_index(data: pd.DataFrame):
 
                 index[(market, int(outcome), odd)] = {
                     "dates": [item[0] for item in values],
-                    "hits": [item[1] for item in values],
                     "prefix": np.cumsum(
                         [item[1] for item in values],
                         dtype=np.int64,
@@ -287,17 +344,12 @@ def exact_odds_probability(
     if odd is None or odd <= 1.0:
         return None, 0
 
-    entry = odds_index.get(
-        (market, int(outcome), round(odd, 2))
-    )
+    entry = odds_index.get((market, int(outcome), round(odd, 2)))
 
     if not entry:
         return None, 0
 
-    count = bisect_left(
-        entry["dates"],
-        day_ns,
-    )
+    count = bisect_left(entry["dates"], day_ns)
 
     if count < MIN_EXACT_ODDS_SAMPLE:
         return None, count
@@ -324,16 +376,12 @@ def brier_score(market: str, probabilities, actual):
         ) / 3.0
 
     try:
-        return (
-            float(probabilities) - float(actual)
-        ) ** 2
+        return (float(probabilities) - float(actual)) ** 2
     except (TypeError, ValueError):
         return None
 
 
 class PerformanceLedger:
-    """Cumulative out-of-sample Brier scores; updates happen only after each day."""
-
     def __init__(self):
         self.global_stats = defaultdict(
             lambda: {
@@ -354,7 +402,7 @@ class PerformanceLedger:
         league_row = self.league_stats[(str(league), market)]
 
         league_n = max(
-            (league_row[s][1] for s in available_sources),
+            (league_row[source][1] for source in available_sources),
             default=0,
         )
 
@@ -362,7 +410,7 @@ class PerformanceLedger:
         stats = league_row if use_league else global_row
 
         sample_n = max(
-            (stats[s][1] for s in available_sources),
+            (stats[source][1] for source in available_sources),
             default=0,
         )
 
@@ -380,15 +428,13 @@ class PerformanceLedger:
                 total, count = stats[source]
 
                 if count:
-                    score = total / count
                     raw[source] = math.exp(
-                        -score / Brier_TEMPERATURE
+                        -(total / count) / BRIER_TEMPERATURE
                     )
                 else:
                     raw[source] = 1.0
 
             denominator = sum(raw.values()) or 1.0
-
             weights = {
                 source: value / denominator
                 for source, value in raw.items()
@@ -399,7 +445,6 @@ class PerformanceLedger:
         return weights, scope, sample_n
 
     def add_day(self, day_records):
-        # This is deliberately called after all fixtures on the same date are predicted.
         for record in day_records:
             league = str(record.get("league", ""))
 
@@ -422,6 +467,48 @@ class PerformanceLedger:
                     self.league_stats[(league, market)][source][0] += score
                     self.league_stats[(league, market)][source][1] += 1
 
+    def to_dict(self):
+        leagues = []
+
+        for (league, market), stats in self.league_stats.items():
+            leagues.append({
+                "league": league,
+                "market": market,
+                "stats": stats,
+            })
+
+        return {
+            "global_stats": dict(self.global_stats),
+            "league_stats": leagues,
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        ledger = cls()
+
+        for market, stats in payload.get("global_stats", {}).items():
+            ledger.global_stats[market] = {
+                source: [
+                    float(stats.get(source, [0.0, 0])[0]),
+                    int(stats.get(source, [0.0, 0])[1]),
+                ]
+                for source in SOURCES
+            }
+
+        for item in payload.get("league_stats", []):
+            key = (str(item["league"]), str(item["market"]))
+            stats = item.get("stats", {})
+
+            ledger.league_stats[key] = {
+                source: [
+                    float(stats.get(source, [0.0, 0])[0]),
+                    int(stats.get(source, [0.0, 0])[1]),
+                ]
+                for source in SOURCES
+            }
+
+        return ledger
+
 
 def normalize_distribution(values):
     clean = {
@@ -435,17 +522,10 @@ def normalize_distribution(values):
     if total <= 0:
         return {}
 
-    return {
-        key: value / total
-        for key, value in clean.items()
-    }
+    return {key: value / total for key, value in clean.items()}
 
 
-def combine_market_sources(
-    market: str,
-    source_probs: dict,
-    weights: dict,
-):
+def combine_market_sources(market: str, source_probs: dict, weights: dict):
     available = [
         source
         for source in weights
@@ -455,11 +535,7 @@ def combine_market_sources(
     if not available:
         return {}, {}
 
-    used = {
-        source: weights[source]
-        for source in available
-    }
-
+    used = {source: weights[source] for source in available}
     total_weight = sum(used.values()) or 1.0
 
     used = {
@@ -468,15 +544,12 @@ def combine_market_sources(
     }
 
     if market == "MS":
-        classes = (1, 0, 2)
         combined = {}
 
-        for cls in classes:
+        for cls in (1, 0, 2):
             combined[cls] = sum(
                 used[source]
-                * float(
-                    source_probs[source][market].get(cls, 0.0)
-                )
+                * float(source_probs[source][market].get(cls, 0.0))
                 for source in available
             )
 
@@ -487,24 +560,12 @@ def combine_market_sources(
         for source in available
     )
 
-    return {
-        1: float(np.clip(probability, 0.0, 1.0))
-    }, used
+    return {1: float(np.clip(probability, 0.0, 1.0))}, used
 
 
-def build_source_probabilities(
-    row,
-    fitted_by_market,
-    odds_index,
-    day_ns,
-):
+def build_source_probabilities(row, fitted_by_market, odds_index, day_ns):
     one_row = pd.DataFrame([row])[FEATURES]
-
-    source_probs = {
-        source: {}
-        for source in SOURCES
-    }
-
+    source_probs = {source: {} for source in SOURCES}
     odds_samples = {}
 
     for market, config in MARKETS.items():
@@ -543,19 +604,13 @@ def build_source_probabilities(
                 source_probs["odds"][market] = normalize_distribution(
                     odds_probs
                 )
-
         elif 1 in odds_probs:
             source_probs["odds"][market] = float(odds_probs[1])
 
     return source_probs, odds_samples
 
 
-def make_joint_prediction(
-    row,
-    source_probs,
-    ledger,
-    odds_samples,
-):
+def make_joint_prediction(row, source_probs, ledger, odds_samples):
     league = str(row.get("league", ""))
 
     joint = {}
@@ -607,11 +662,8 @@ def make_joint_prediction(
                             odds_samples.get("MS", {}).get(str(cls), 0)
                         ),
                     }
-
         else:
-            label = market
-
-            joint[label] = {
+            joint[market] = {
                 "probability": float(probabilities.get(1, 0.0)),
                 "correct": None,
                 "odds_samples": int(
@@ -636,13 +688,10 @@ def result_for_label(row, label):
 
         return actual == wanted
 
-    market = label if label in MARKETS else None
-
-    if market is None:
+    if label not in MARKETS:
         return None
 
-    actual = get_actual(row, market)
-
+    actual = get_actual(row, label)
     return None if actual is None else actual == 1
 
 
@@ -683,16 +732,13 @@ def update_result_fields(prediction, row):
     return prediction
 
 
-def main():
+def load_input():
     if not INPUT.exists():
         raise FileNotFoundError(
             f"Önce convert_excel_to_json.py çalıştırılmalı: {INPUT}"
         )
 
-    data = pd.read_json(
-        INPUT,
-        convert_dates=["date"],
-    )
+    data = pd.read_json(INPUT, convert_dates=["date"])
 
     data["date"] = pd.to_datetime(
         data["date"],
@@ -726,6 +772,7 @@ def main():
         kind="stable",
     ).reset_index(drop=True)
 
+    # Mevcut veri filtresi aynen korunuyor.
     valid_odds = data[FEATURES].notna().sum(axis=1) >= 3
     data = data.loc[valid_odds].copy()
 
@@ -734,34 +781,143 @@ def main():
             "En az üç açılış oranı bulunan maç bulunamadı."
         )
 
-    OUTPUT.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    return data
 
-    if OUTPUT.exists() and not BACKUP.exists():
-        shutil.copy2(
-            OUTPUT,
-            BACKUP,
+
+def load_existing_output():
+    if not OUTPUT.exists():
+        return []
+
+    try:
+        payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        predictions = payload.get("predictions", [])
+
+        if not isinstance(predictions, list):
+            return []
+
+        return predictions
+
+    except Exception:
+        return []
+
+
+def load_incremental_state(data):
+    """Return cached state only if both input prefix and output are intact."""
+    if not STATE_FILE.exists() or not OUTPUT.exists():
+        return None
+
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+        if state.get("version") != STATE_VERSION:
+            return None
+
+        if state.get("output_sha256") != file_sha256(OUTPUT):
+            return None
+
+        last_date = state.get("last_processed_date")
+
+        if not last_date:
+            return None
+
+        prefix = data[
+            data["date"] <= pd.Timestamp(last_date)
+        ].copy()
+
+        current_fingerprint = input_fingerprint(prefix)
+
+        if current_fingerprint != state.get("input_fingerprint"):
+            return None
+
+        ledger = PerformanceLedger.from_dict(
+            state.get("ledger", {})
         )
 
+        predictions = load_existing_output()
+
+        return {
+            "last_date": last_date,
+            "ledger": ledger,
+            "predictions": predictions,
+        }
+
+    except Exception as exc:
+        log(f"Önbellek okunamadı, tam hesaplama yapılacak: {exc}")
+        return None
+
+
+def save_json_atomic(path: Path, temp_path: Path, payload):
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    os.replace(temp_path, path)
+
+
+def main():
+    data = load_input()
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if OUTPUT.exists() and not BACKUP.exists():
+        shutil.copy2(OUTPUT, BACKUP)
         log(f"Mevcut tahmin dosyası yedeklendi: {BACKUP}")
 
     log(f"Toplam maç: {len(data):,}")
-    log("Exact oran geçmiş indeksi hazırlanıyor...")
 
+    cached = load_incremental_state(data)
+
+    if cached:
+        ledger = cached["ledger"]
+        predictions = cached["predictions"]
+        last_processed_date = cached["last_date"]
+
+        log(
+            f"Önbellek geçerli. Son tamamlanan tarih: "
+            f"{last_processed_date}"
+        )
+        log(f"Mevcut tahmin korunuyor: {len(predictions):,}")
+
+    else:
+        ledger = PerformanceLedger()
+        predictions = []
+        last_processed_date = None
+
+        log("Önbellek yok veya geçmiş veri değişmiş.")
+        log("Tam kronolojik hesaplama başlatılıyor.")
+
+    log("Exact oran geçmiş indeksi hazırlanıyor...")
     odds_index = build_odds_index(data)
-    ledger = PerformanceLedger()
-    predictions = []
 
     unique_days = sorted(
         pd.Timestamp(value)
         for value in data["date"].drop_duplicates()
     )
 
-    log(f"Kronolojik tahmin günü: {len(unique_days):,}")
+    if last_processed_date:
+        start_date = pd.Timestamp(last_processed_date)
+        pending_days = [
+            day for day in unique_days
+            if day > start_date
+        ]
+    else:
+        pending_days = unique_days
 
-    for day_number, day in enumerate(unique_days, start=1):
+    log(f"Toplam tarih: {len(unique_days):,}")
+    log(f"Yeni işlenecek tarih: {len(pending_days):,}")
+
+    if not pending_days:
+        log("Yeni tarih bulunamadı. Mevcut tahminler korunuyor.")
+
+    for day_number, day in enumerate(pending_days, start=1):
         day_rows = data[data["date"] == day]
         train = data[data["date"] < day]
 
@@ -770,7 +926,13 @@ def main():
                 f"{day.date()}: yeterli geçmiş eğitim verisi yok "
                 f"({len(train)}), atlandı"
             )
+            last_processed_date = day.strftime("%Y-%m-%d")
             continue
+
+        log(
+            f"[{day_number}/{len(pending_days)}] "
+            f"{day.date()} modeller eğitiliyor..."
+        )
 
         fitted_by_market = {}
 
@@ -783,6 +945,7 @@ def main():
 
         day_records_for_ledger = []
         day_ns = pd.Timestamp(day).value
+        day_prediction_count = 0
 
         for _, series in day_rows.iterrows():
             row = series.to_dict()
@@ -838,12 +1001,9 @@ def main():
                 "fixture_id": key,
             }
 
-            prediction = update_result_fields(
-                prediction,
-                row,
-            )
-
+            prediction = update_result_fields(prediction, row)
             predictions.append(prediction)
+            day_prediction_count += 1
 
             actuals = {
                 market: get_actual(row, market)
@@ -856,21 +1016,22 @@ def main():
                 "actuals": actuals,
             })
 
-        # Update model performance only after every match of this date was predicted.
+        # Aynı günün maçları tahmin edildikten sonra performans güncellenir.
         ledger.add_day(day_records_for_ledger)
 
+        last_processed_date = day.strftime("%Y-%m-%d")
+
         log(
-            f"[{day_number}/{len(unique_days)}] {day.date()}: "
-            f"{len(day_records_for_ledger)} maç tahmin edildi; "
-            f"önceki eğitim maçı={len(train):,}"
+            f"{day.date()}: {day_prediction_count} tahmin; "
+            f"eğitim maç sayısı={len(train):,}"
         )
 
     predictions.sort(
         key=lambda item: (
-            item["date"],
-            item["time"],
-            item["home"],
-            item["away"],
+            item.get("date", ""),
+            item.get("time", ""),
+            item.get("home", ""),
+            item.get("away", ""),
         )
     )
 
@@ -884,30 +1045,39 @@ def main():
         "predictions": predictions,
     }
 
-    TEMP_OUTPUT.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
-    )
+    # Önce tahmin dosyası yazılır.
+    save_json_atomic(OUTPUT, TEMP_OUTPUT, payload)
 
-    # Atomic replace: a failed generation never leaves a partially written predictions.json.
-    os.replace(
-        TEMP_OUTPUT,
-        OUTPUT,
-    )
+    # Ardından state dosyası yazılır. İki dosya uyuşmazsa sonraki çalışmada
+    # hash kontrolü önbelleği reddeder ve tam hesaplama yapar.
+    if last_processed_date:
+        completed_prefix = data[
+            data["date"] <= pd.Timestamp(last_processed_date)
+        ]
+
+        state_payload = {
+            "version": STATE_VERSION,
+            "last_processed_date": last_processed_date,
+            "input_fingerprint": input_fingerprint(completed_prefix),
+            "output_sha256": file_sha256(OUTPUT),
+            "ledger": ledger.to_dict(),
+        }
+
+        save_json_atomic(
+            STATE_FILE,
+            TEMP_STATE,
+            state_payload,
+        )
 
     log(
         f"Tamamlandı: {len(predictions):,} tahmin -> "
         f"{OUTPUT} ({OUTPUT.stat().st_size:,} bayt)"
     )
 
-    log(
-        f"Yedek dosya: "
-        f"{BACKUP if BACKUP.exists() else 'önceden mevcut yedek yok'}"
-    )
+    log(f"Durum dosyası: {STATE_FILE}")
+
+    if BACKUP.exists():
+        log(f"Yedek dosya: {BACKUP}")
 
 
 if __name__ == "__main__":
