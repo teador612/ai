@@ -1,3 +1,4 @@
+
 name: Build predictions and deploy GitHub Pages
 
 on:
@@ -8,6 +9,7 @@ on:
     paths:
       - "input/**"
       - "docs/**"
+      - "cache/**"
       - "generate_predictions.py"
       - "convert_excel_to_json.py"
       - "requirements.txt"
@@ -59,6 +61,9 @@ jobs:
           elif [[ ! -s docs/predictions.json ]]; then
             REBUILD=true
 
+          elif [[ ! -s cache/predictions_state.json ]]; then
+            REBUILD=true
+
           else
             BASE_SHA="$EVENT_BEFORE"
 
@@ -94,7 +99,7 @@ jobs:
         if: steps.rebuild.outputs.enabled == 'true'
         run: python generate_predictions.py
 
-      - name: Save JSON files to repository
+      - name: Save JSON and incremental state
         if: steps.rebuild.outputs.enabled == 'true'
         shell: bash
         run: |
@@ -103,6 +108,7 @@ jobs:
 
           git add input/matches.json
           git add docs/predictions.json
+          git add cache/predictions_state.json
 
           if [[ -f docs/predictions.backup.json ]]; then
             git add docs/predictions.backup.json
