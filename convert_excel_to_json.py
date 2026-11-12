@@ -8,7 +8,7 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parent
-XLSX = ROOT / "input" / "Excel-Açılış-Cep-Telefonu.xlsx"
+XLSX = ROOT / "input" / "acilis.xlsx"
 JSON = ROOT / "input" / "matches.json"
 
 FEATURES = [f"odds_{i}" for i in range(36, 75)]
