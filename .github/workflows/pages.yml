@@ -9,7 +9,6 @@ on:
     paths:
       - "input/**"
       - "docs/**"
-      - "cache/**"
       - "generate_predictions.py"
       - "convert_excel_to_json.py"
       - "requirements.txt"
@@ -21,8 +20,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: github-pages
-  cancel-in-progress: true
+  group: nexus-predictions-pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -39,11 +38,38 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Sync branch before build
+        shell: bash
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git fetch origin "$BRANCH"
+          git rebase "origin/$BRANCH"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Restore incremental cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: cache
+          key: nexus-cache-${{ github.run_id }}
+          restore-keys: |
+            nexus-cache-
+
+      - name: Report cache status
+        shell: bash
+        env:
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -n "$MATCHED_KEY" ]]; then
+            echo "CACHE_RESTORED: $MATCHED_KEY"
+          else
+            echo "CACHE_MISS: Tam hesaplama gerekebilir."
+          fi
 
       - name: Check whether predictions need rebuilding
         id: rebuild
@@ -73,7 +99,7 @@ jobs:
 
             if [[ -z "$BASE_SHA" ]]; then
               REBUILD=true
-            elif ! git diff --quiet "$BASE_SHA" "$CURRENT_SHA" -- \
+            elif ! git diff --quiet "$BASE_SHA" HEAD -- \
               input/ \
               generate_predictions.py \
               convert_excel_to_json.py \
@@ -118,13 +144,17 @@ jobs:
             git commit -m "Refresh chronological predictions"
 
             BRANCH="${GITHUB_REF_NAME}"
-
-            git fetch origin "$BRANCH"
-            git rebase "origin/$BRANCH"
             git push origin "HEAD:$BRANCH"
           else
             echo "Kaydedilecek değişiklik bulunamadı."
           fi
+
+      - name: Save incremental cache
+        if: success() && steps.rebuild.outputs.enabled == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: cache
+          key: nexus-cache-${{ github.run_id }}
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
